@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# .env files
+.env
+.venv/
+venv/
+ENV/
+env/
+
+# Distribuição de pacotes
+.Python
+build/
+dist/
+eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Vários IDEs e editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Teste de arquivos
+.tox/
+.nox/
+coverage.*
+*.cover
+*.log
+nosetests.xml
+pytestdebug.log
+
+# airflow
+airflow/logs/
