@@ -40,3 +40,6 @@ pytestdebug.log
 
 # airflow
 airflow/logs/
+
+# minio
+minio-lake/
