@@ -1,69 +1,106 @@
-# airflow/scripts/extract_data.py
-
+import requests
 import json
 import logging
-import requests
-import pandas as pd
-from datetime import datetime
+import boto3
+from botocore.exceptions import ClientError, EndpointConnectionError
 from io import BytesIO
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from typing import Dict, Any, List
+from datetime import datetime
+import os
 
-# Configuração
-logging.basicConfig(level=logging.INFO)
-MINIO_CONN_ID = "s3_default" # Nome da conexao S3 definida no docker-compose.yml
-BUCKET_NAME = "bronze-layer"
-RAW_DATA_URL = "https://api.openbrewerydb.org/v1/breweries"
+# Configurar logging
+logging.basicConfig(level=logging.DEBUG)
+log = logging.getLogger(__name__)
 
-
-def extract_and_upload_to_bronze():
+def bronze_layer_ingestion(
+    execution_date: str,
+    raw_data_url: str,
+    bucket_name: str = "bronze-layer",
+    endpoint_url: str = None
+) -> str:
     """
-    Extrai dados brutos de uma API externa e faz o upload
-    para a Bronze Layer (MinIO).
+    Extrai dados brutos da API para a Bronze Layer (MinIO), usando a data de execução
+    para particionamento.
+
+    Args:
+        execution_date (str): Data de execução para particionamento (ex.: '2025-10-06').
+        raw_data_url (str): URL da API para extrair dados.
+        bucket_name (str): Nome do bucket no MinIO (default: 'bronze-layer').
+        endpoint_url (str): URL do endpoint MinIO (default: None, tenta variável de ambiente).
+
+    Returns:
+        str: A chave S3 (caminho) onde o arquivo foi salvo.
+
+    Raises:
+        Exception: Se houver erro na extração ou upload.
     """
-    logging.info("Iniciando a extração de dados brutos.")
-    
+    # Determinar o endpoint (prioridade: parâmetro > env var > default Docker)
+    if endpoint_url is None:
+        endpoint_url = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")  # Use 'minio:9000' para Docker
+    log.debug(f"Iniciando ingestão para bucket: {bucket_name}, endpoint: {endpoint_url}")
+
     try:
-        # 1. Extração dos Dados da Fonte (API)
-        response = requests.get(RAW_DATA_URL)
-        response.raise_for_status() # Lanca erro para status 4xx/5xx
+        # 1. Testar conectividade com o MinIO
+        log.debug("Testando conectividade com o endpoint MinIO...")
+        response = requests.get(f"{endpoint_url}/minio/health/live")
+        if response.status_code != 200:
+            raise Exception(f"MinIO não está acessível em {endpoint_url}. Status: {response.status_code}")
+        log.debug("MinIO está acessível!")
+
+        # 2. Extrair dados da API
+        log.debug(f"Extraindo dados de {raw_data_url}")
+        response = requests.get(raw_data_url)
+        response.raise_for_status()
         raw_data = response.json()
-        
-        logging.info(f"Dados extraídos com sucesso. Total de {len(raw_data)} registros.")
+        log.info(f"Sucesso na extração. Encontrados '{len(raw_data)}' registros.")
 
-        # 2. Converte os dados para o formato que o S3Hook aceita (JSON em um buffer)
-        file_content = json.dumps(raw_data, indent=2)
-        
-        # 3. Define o caminho no MinIO (Chave)
-        # O dado é salvo com carimbo de data/hora para garantir idempotência e rastreabilidade
-        current_date_str = datetime.now().strftime("%Y/%m/%d")
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        
-        s3_key = f"raw_data/beer_data/{current_date_str}/raw_beer_data_{timestamp}.json"
+        # 3. Converte para bytes
+        file_bytes = json.dumps(raw_data, indent=2).encode('utf-8')
+        data_stream = BytesIO(file_bytes)
 
-        # 4. Upload para o MinIO (Bronze Layer)
-        s3_hook = S3Hook(aws_conn_id=MINIO_CONN_ID)
-        
-        # Usamos o 'replace=True' para garantir que o arquivo seja sobrescrito se a chave for a mesma
-        s3_hook.load_string(
-            string_data=file_content,
-            key=s3_key,
-            bucket_name=BUCKET_NAME,
-            replace=True,
-            encoding='utf-8'
+        # 4. Define o caminho no MinIO
+        s3_key = f"breweries/dt={execution_date}/breweries.json"
+        log.debug(f"Chave S3: {s3_key}")
+
+        # 5. Configura o cliente boto3 para MinIO
+        log.debug("Configurando cliente boto3...")
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=os.environ.get("MINIO_ROOT_USER", "minioadmin"),
+            aws_secret_access_key=os.environ.get("MINIO_ROOT_PASSWORD", "minioadmin")
         )
 
-        logging.info(f"Dados brutos enviados com sucesso para s3://{BUCKET_NAME}/{s3_key}")
-        
-        # Retorna a chave do S3 para ser usada pelo proximo passo (Silver)
+        # 6. Faz o upload para o MinIO
+        log.debug(f"Fazendo upload para s3://{bucket_name}/{s3_key}")
+        s3_client.upload_fileobj(
+            Fileobj=data_stream,
+            Bucket=bucket_name,
+            Key=s3_key,
+            ExtraArgs={"ContentType": "application/json"}
+        )
+        log.info(f"Dados brutos enviados com sucesso para s3://{bucket_name}/{s3_key}")
+
+        # 7. Verifica se o arquivo é acessível publicamente
+        public_url = f"{endpoint_url}/{bucket_name}/{s3_key}"
+        log.debug(f"Testando acesso público em: {public_url}")
+        response = requests.get(public_url)
+        if response.status_code == 200:
+            log.info(f"Arquivo acessível publicamente em: {public_url}")
+        else:
+            log.warning(f"Falha ao acessar o arquivo publicamente: {response.status_code}")
+
         return s3_key
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"Erro na extração da API: {e}")
+        log.error(f"Erro ao extrair dados da API: {e}")
+        raise
+    except EndpointConnectionError as e:
+        log.error(f"Erro ao conectar ao endpoint MinIO {endpoint_url}: {e}")
+        raise
+    except ClientError as e:
+        log.error(f"Erro ao fazer upload para o MinIO: {e}")
         raise
     except Exception as e:
-        logging.error(f"Erro no upload para o MinIO: {e}")
+        log.error(f"Erro no processo de ingestão: {e}")
         raise
-
-
-if __name__ == "__main__":
-    extract_and_upload_to_bronze()

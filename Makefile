@@ -6,3 +6,6 @@ up-db:
 
 up:
 	docker compose up -d
+
+it:
+	docker exec -it desafio-bees-airflow-apiserver-1 /bin/bash
