@@ -49,7 +49,10 @@ x-airflow-common:
   # In order to add custom dependencies or upgrade provider distributions you can use your extended image.
   # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
   # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.1.0}
+  # image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.1.0}
+  build:
+      context: ./airflow
+      dockerfile: Dockerfile_airflow
   # build: .
   environment:
     &airflow-common-env
@@ -62,6 +65,12 @@ x-airflow-common:
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    # AIRFLOW_CONN_minio_s3: 's3://minio_user:minio_password@minio:9000'
+    AIRFLOW_CONN_minio_s3: 's3://minio_user:minio_password@minio:9000?endpoint_url=http://minio:9000&aws_access_key_id=minio_user&aws_secret_access_key=minio_password'
+    MINIO_ENDPOINT_URL: http://minio:9000
+    MINIO_ACCESS_KEY: minio_user
+    MINIO_SECRET_KEY: minio_password
+    AIRFLOW__ASTRO_SDK_S3_CONN_ID: minio_s3
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
@@ -77,6 +86,7 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/airflow/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/airflow/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/airflow/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/migrations:/opt/airflow/dags/migrations
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -89,22 +99,59 @@ x-airflow-common:
 
 services:
   minio:
-    image: minio/minio
+    image: quay.io/minio/minio:latest
+    container_name: desafio-bees-minio-1
     ports:
-      - "9000:9000" # API S3
-      - "9001:9001" # UI Console
+      - "9000:9000"
+      - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_BROWSER_REDIRECT_URL: 'http://localhost:9001'
-    command: server /data --console-address ":9001"
-    healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
-      interval: 30s
-      timeout: 20s
-      retries: 3
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_BROWSER_REDIRECT_URL=http://localhost:9001
     volumes:
       - ./minio-lake:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  minio-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Aguardando MinIO...';
+      until curl -s -f http://minio:9000/minio/health/live; do
+        echo 'MinIO não está pronto, aguardando 5 segundos...';
+        sleep 5;
+      done;
+      aws --endpoint-url http://minio:9000 s3api create-bucket --bucket bronze-layer;
+      aws --endpoint-url http://minio:9000 s3api create-bucket --bucket silver-layer;
+      aws --endpoint-url http://minio:9000 s3api create-bucket --bucket gold-layer;
+      cat <<EOF > policy.json
+      {
+        \"Version\": \"2012-10-17\",
+        \"Statement\": [
+          {
+            \"Effect\": \"Allow\",
+            \"Principal\": \"*\",
+            \"Action\": [\"s3:GetObject\"],
+            \"Resource\": [\"arn:aws:s3:::my-public-bucket/*\"]
+          }
+        ]
+      }
+      EOF
+      aws --endpoint-url http://minio:9000 s3api put-bucket-policy --bucket my-public-bucket --policy file://policy.json;
+      echo 'Bucket criado e configurado!';
+      "
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
 
   postgres:
     image: postgres:16
@@ -112,6 +159,9 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    depends_on:
+      minio:
+        condition: service_healthy
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
@@ -206,6 +256,9 @@ services:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+
 
   airflow-triggerer:
     <<: *airflow-common
@@ -353,3 +406,4 @@ services:
 
 volumes:
   postgres-db-volume:
+  # minio-data:
