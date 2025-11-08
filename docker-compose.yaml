@@ -51,7 +51,7 @@ x-airflow-common:
   # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
   # image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.1.0}
   build:
-      context: ./airflow
+      context: .
       dockerfile: Dockerfile_airflow
   # build: .
   environment:
